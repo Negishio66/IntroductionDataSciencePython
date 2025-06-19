@@ -1,4 +1,4 @@
-from Similarity.similarity_coefficient import SimilarityCoefficient
+from similarity_coefficient import SimilarityCoefficient
 from typing import Set, Any
 
 class JaccardCoefficient(SimilarityCoefficient):
