@@ -1,200 +1,225 @@
-import sys
 import csv
-import sqlite3
-import time
 import os
+import sqlite3
+import sys
+import time
 import psutil
 
 class insertStationInfo:
     """
-    A class to read station information from a CSV file and insert it into an SQLite database.
-    It also provides methods to retrieve performance metrics like execution time and memory usage.
+    Manages the process of reading a CSV file and populating a database.
+
+    This class handles the database connection, table creation, CSV parsing,
+    and data insertion. It also provides methods to retrieve performance
+    and processing metrics.
     """
 
-    def __init__(self, file_name, db_name="stations.db"):
+    def __init__(self, file_path, db_name="station_data.db"):
         """
-        Initializes the class, setting up the file path and database connection.
+        Initializes the insertStationInfo object.
 
-        :param file_name: The path to the CSV file to be processed.
-        :type file_name: str
+        :param file_path: The path to the input CSV file.
+        :type file_path: str
         :param db_name: The name of the SQLite database file to use.
         :type db_name: str
         """
-        self.file_name = file_name
-        self.rows_in_csv = 0
-        self.rows_inserted = 0
-        self.runtime = 0.0
-        self.mem_rss_bytes = 0
-        self.mem_uss_bytes = 0
-        
-        # Get the process for memory profiling
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"The file '{file_path}' was not found.")
+
+        self.file_path = file_path
+        self.db_name = db_name
+        self.conn = None
         self.process = psutil.Process(os.getpid())
-        
-        # --- Database Setup ---
-        try:
-            # Connect to the SQLite database. It will be created if it doesn't exist.
-            self.conn = sqlite3.connect(db_name)
-            self.cursor = self.conn.cursor()
-            self._create_table()
-        except sqlite3.Error as e:
-            print(f"Database error: {e}", file=sys.stderr)
-            # In a notebook, we might not want to exit, so we raise the error
-            raise
 
-    def _create_table(self):
+        # Initialize metrics
+        self._rows_in_csv = 0
+        self._rows_inserted = 0
+        self._runtime = 0.0
+        self._memory_rss_bytes = 0
+        self._memory_uss_bytes = 0
+
+    def _connect_db(self):
         """
-        Creates the 'station_info' table in the database if it does not already exist.
-        The table schema is designed to hold station data.
-
-        :raises sqlite3.Error: If there is an issue creating the table.
+        Establishes a connection to the SQLite database and creates the
+        'station_info' table if it doesn't already exist.
         """
         try:
-            self.cursor.execute('''
+            self.conn = sqlite3.connect(self.db_name)
+            cursor = self.conn.cursor()
+            # Create table with a schema that matches stationInfo.csv
+            # Using 'IF NOT EXISTS' prevents errors on subsequent runs.
+            # Using 'station_id' as PRIMARY KEY to prevent duplicates.
+            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS station_info (
                     station_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    latitude REAL,
-                    longitude REAL,
-                    capacity INTEGER
+                    name TEXT,
+                    short_name TEXT,
+                    lat REAL,
+                    lon REAL,
+                    capacity INTEGER,
+                    system_id TEXT,
+                    timezone TEXT,
+                    rental_methods TEXT
                 )
             ''')
             self.conn.commit()
         except sqlite3.Error as e:
-            print(f"Error creating table: {e}", file=sys.stderr)
-            raise
+            print(f"Database error: {e}")
+            sys.exit(1)
 
     def run(self):
         """
-        Executes the main logic: reading the CSV and inserting data into the database.
-        This method measures the runtime and memory usage of the operation.
+        Executes the main logic: reading the CSV and inserting into the DB.
+
+        This method orchestrates the entire process, including timing,
+        memory measurement, file reading, and database insertion.
         """
-        start_time = time.monotonic()
-        
+        start_time = time.perf_counter()
+        initial_mem_info = self.process.memory_info()
+
+        self._connect_db()
+
         try:
-            with open(self.file_name, mode='r', encoding='utf-8') as csvfile:
-                reader = csv.reader(csvfile)
-                header = next(reader) # Skip header row
+            # Use a broader encoding in case of file variations
+            with open(self.file_path, mode='r', encoding='utf-8-sig') as infile:
+                reader = csv.DictReader(infile)
+                data = list(reader)
+                self._rows_in_csv = len(data)
 
-                for row in reader:
-                    self.rows_in_csv += 1
+                cursor = self.conn.cursor()
+                for i, row in enumerate(data):
                     try:
-                        # Assumes CSV columns are in order: station_id, name, latitude, longitude, capacity
-                        station_id = row[0]
-                        name = row[1]
-                        latitude = float(row[2])
-                        longitude = float(row[3])
-                        capacity = int(row[4])
+                        lat = 0.0
+                        lon = 0.0
 
-                        self.cursor.execute('''
-                            INSERT OR IGNORE INTO station_info (station_id, name, latitude, longitude, capacity)
-                            VALUES (?, ?, ?, ?, ?)
-                        ''', (station_id, name, latitude, longitude, capacity))
+                        # FIX: The CSV contains coordinates in a single 'Point(lon lat)' string.
+                        # This logic finds that string, parses it, and extracts lat/lon.
+                        # It checks common column names where this data might be.
+                        point_str = next((row.get(key) for key in ['lat', 'location', 'point', 'the_geom'] if row.get(key)), None)
+
+                        if point_str and 'Point' in point_str:
+                            try:
+                                # Extract numbers from 'Point(141.35 43.06)'
+                                clean_str = point_str.strip().replace('Point(', '').replace(')', '')
+                                coords = clean_str.split()
+                                if len(coords) >= 2:
+                                    lon = float(coords[0])
+                                    lat = float(coords[1])
+                            except (ValueError, IndexError) as parse_error:
+                                print(f"Warning: Row {i + 2}: Could not parse coordinate string '{point_str}'. Error: {parse_error}")
                         
-                        # rowcount will be 1 if a row was inserted, 0 if it was ignored (due to PRIMARY KEY constraint)
-                        if self.cursor.rowcount > 0:
-                            self.rows_inserted += 1
+                        # Safely get and convert capacity
+                        cap_val = row.get('capacity')
+                        capacity = int(float(cap_val)) if cap_val and cap_val.replace('.', '', 1).isdigit() else 0
 
-                    except (ValueError, IndexError) as e:
-                        print(f"Skipping malformed row {self.rows_in_csv + 1}: {row}. Error: {e}", file=sys.stderr)
-                    except sqlite3.Error as e:
-                        print(f"Database error on row {self.rows_in_csv + 1}: {e}", file=sys.stderr)
+                        # Use 'INSERT OR IGNORE' to skip rows with duplicate station_id
+                        cursor.execute('''
+                            INSERT OR IGNORE INTO station_info (
+                                station_id, name, short_name, lat, lon, capacity,
+                                system_id, timezone, rental_methods
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            row.get('station_id'), row.get('name'), row.get('short_name'),
+                            lat, lon, capacity,
+                            row.get('system_id'), row.get('timezone'),
+                            row.get('rental_methods')
+                        ))
+                        self._rows_inserted += cursor.rowcount
+                    except Exception as e:
+                        # Catch any other unexpected errors in a row
+                        print(f"Skipping malformed row {i + 2} due to unexpected error: {e}")
 
             self.conn.commit()
 
-        except FileNotFoundError:
-            print(f"Error: The file '{self.file_name}' was not found.", file=sys.stderr)
-            return # Stop execution if file not found
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}", file=sys.stderr)
-            return
+        except IOError as e:
+            print(f"Error reading file {self.file_path}: {e}")
         finally:
-            # Ensure the connection is closed
             if self.conn:
                 self.conn.close()
-        
-        end_time = time.monotonic()
-        self.runtime = end_time - start_time
-        
-        # --- Memory Measurement ---
-        mem_info = self.process.memory_info()
-        self.mem_rss_bytes = mem_info.rss
-        # USS is not available on all platforms, handle gracefully
-        try:
-            self.mem_uss_bytes = self.process.memory_full_info().uss
-        except (psutil.AccessDenied, AttributeError):
-            self.mem_uss_bytes = 0 # USS not supported or accessible
-            print("Warning: USS memory metric not available or accessible on this system.", file=sys.stderr)
+
+        end_time = time.perf_counter()
+        final_mem_info = self.process.memory_info()
+
+        self._runtime = end_time - start_time
+        self._memory_rss_bytes = final_mem_info.rss - initial_mem_info.rss
+        if hasattr(final_mem_info, 'uss'):
+            self._memory_uss_bytes = final_mem_info.uss - initial_mem_info.uss
+        else:
+            self._memory_uss_bytes = None
 
     def getRows(self):
         """
         Returns the total number of data rows found in the CSV file.
 
-        :returns: The total count of rows in the CSV.
+        :return: The count of rows in the CSV (excluding the header).
         :rtype: int
         """
-        return self.rows_in_csv
+        return self._rows_in_csv
 
     def getRowsInserted(self):
         """
-        Returns the total number of rows successfully inserted into the database.
+        Returns the number of rows successfully inserted into the database.
 
-        :returns: The total count of inserted rows.
+        :return: The count of newly inserted rows.
         :rtype: int
         """
-        return self.rows_inserted
+        return self._rows_inserted
 
     def getMemoryUSS(self):
         """
-        Returns the total USS memory consumed by the program in a formatted string (MB).
+        Returns the Unique Set Size (USS) memory consumed by the run.
 
-        :returns: A string representing the USS memory in megabytes, or 'N/A'.
+        :return: The consumed USS memory as a formatted string or 'N/A'.
         :rtype: str
         """
-        if self.mem_uss_bytes == 0:
+        if self._memory_uss_bytes is None:
             return "N/A"
-        return f"{self.mem_uss_bytes / (1024 * 1024):.2f} MB"
+        return f"{self._memory_uss_bytes / 1024**2:.2f} MB"
 
     def getMemoryRSS(self):
         """
-        Returns the total RSS memory consumed by the program in a formatted string (MB).
+        Returns the Resident Set Size (RSS) memory consumed by the run.
 
-        :returns: A string representing the RSS memory in megabytes.
+        :return: The consumed RSS memory as a formatted string.
         :rtype: str
         """
-        return f"{self.mem_rss_bytes / (1024 * 1024):.2f} MB"
+        return f"{self._memory_rss_bytes} Bytes"
 
     def getRuntime(self):
         """
-        Returns the total time taken for the run() method in a formatted string (seconds).
+        Returns the total time taken for the run() method to execute.
 
-        :returns: A string representing the runtime in seconds.
+        :return: The total execution time as a formatted string.
         :rtype: str
         """
-        return f"{self.runtime:.4f} seconds"
+        return f"{self._runtime:.4f} seconds"
 
 if __name__ == "__main__":
     """
-    Main execution block for command-line use.
-    It expects the CSV file name as a command-line argument.
+    Main execution block to run the script from the command line.
     """
     if len(sys.argv) < 2:
         print("Usage: python insertStationInfo.py <path_to_csv_file>")
         sys.exit(1)
-        
-    csv_file_path = sys.argv[1]
 
-    print("Starting data insertion process from command line...")
-    
-    # Instantiate and run the process
-    obj = insertStationInfo(file_name=csv_file_path)
-    obj.run()
+    file_name = sys.argv[1]
 
-    # --- Output Results ---
-    print("\n--- Execution Report ---")
-    print(f"Total rows in CSV: {obj.getRows()}")
-    print(f"Rows successfully inserted: {obj.getRowsInserted()}")
-    print(f"Total Runtime: {obj.getRuntime()}")
-    print(f"Memory (RSS): {obj.getMemoryRSS()}")
-    print(f"Memory (USS): {obj.getMemoryUSS()}")
-    print("------------------------")
-    print("Process finished.")
+    try:
+        print(f"Processing file: {file_name}")
+        obj = insertStationInfo(file_name)
+        obj.run()
+
+        print("\n--- Processing Report ---")
+        print(f"Total rows in CSV:     {obj.getRows()}")
+        print(f"Rows inserted into DB: {obj.getRowsInserted()}")
+        print(f"Total runtime:         {obj.getRuntime()}")
+        print(f"Memory RSS consumed:   {obj.getMemoryRSS()}")
+        print(f"Memory USS consumed:   {obj.getMemoryUSS()}")
+        print("-------------------------\n")
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        sys.exit(1)
